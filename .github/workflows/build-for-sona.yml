@@ -71,7 +71,11 @@ jobs:
         with:
           node-version: "22"
 
+      # 显式指定版本：被其他仓库以 workflow_call 调用时，
+      # 自动从 package.json 的 packageManager 字段推断并不可靠。
       - uses: pnpm/action-setup@v4
+        with:
+          version: 9.14.2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
