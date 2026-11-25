@@ -22,6 +22,10 @@ on:
         description: "Version to stamp into tauri.conf.json, without the v prefix"
         required: true
         type: string
+      ref:
+        description: "Commit of this repository to build; the caller passes the submodule commit it pins"
+        required: true
+        type: string
       updater_endpoint:
         description: "Updater endpoint for this fork's latest.json; empty disables the updater"
         required: false
@@ -38,6 +42,11 @@ on:
         description: "Version to stamp into tauri.conf.json, without the v prefix"
         required: true
         type: string
+      ref:
+        description: "Commit of this repository to build; defaults to the dispatched ref"
+        required: false
+        type: string
+        default: ""
       updater_endpoint:
         description: "Updater endpoint; empty disables the updater"
         required: false
@@ -60,9 +69,13 @@ jobs:
       contents: read
 
     steps:
+      # A reusable workflow checks out the caller's repository by default, so this
+      # names this repository and the commit the caller pins.
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          repository: gyyst/ltk-manager
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 0
           submodules: recursive
 
