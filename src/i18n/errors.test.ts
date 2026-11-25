@@ -146,6 +146,20 @@ describe("describePatcherError", () => {
       describePatcherError({ kind: "INJECTION_FAILED", stage: "INJECTION", message: "no DLL" }),
     ).toEqual({ title: m["patcher.INJECTION_FAILED.INJECTION.title"](), detail: "no DLL" });
   });
+
+  it("points a staging refusal at the install directory", () => {
+    expect(describePatcherError({ kind: "STAGING_REFUSED", message: "cannot stage" })).toEqual({
+      title: m["patcher.STAGING_REFUSED.title"](),
+      description: m["patcher.STAGING_REFUSED.description"](),
+    });
+  });
+
+  it("titles a failed build and keeps the builder's reason", () => {
+    expect(describePatcherError({ kind: "BUILD_FAILED", message: "no game path" })).toEqual({
+      title: m["patcher.BUILD_FAILED.title"](),
+      detail: "no game path",
+    });
+  });
 });
 
 describe("describeWorkshopError", () => {

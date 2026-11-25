@@ -114,6 +114,18 @@ fn every_patcher_variant_reaches_the_frontend_distinguishable() {
         (PatcherError::LeagueElevated, "LEAGUE_ELEVATED"),
         (PatcherError::ManagerElevated, "MANAGER_ELEVATED"),
         (
+            PatcherError::StagingRefused {
+                message: "install the manager under Program Files".to_string(),
+            },
+            "STAGING_REFUSED",
+        ),
+        (
+            PatcherError::BuildFailed {
+                message: "the game path is not configured".to_string(),
+            },
+            "BUILD_FAILED",
+        ),
+        (
             PatcherError::DllUnavailable {
                 reason: ltk_manager_runtime::patcher::delivery::DeliveryFailure::Network,
             },

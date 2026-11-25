@@ -8,6 +8,7 @@ use std::thread::JoinHandle;
 use ltk_manager_base::events::OverlayProgress;
 use serde::{Deserialize, Serialize};
 
+use super::error::PatcherError;
 use super::refresh::OverlayRefresh;
 
 /// Current phase of the patcher lifecycle.
@@ -92,6 +93,9 @@ pub struct PatcherStateInner {
     pub overlay_progress: Option<OverlayProgress>,
     /// Last patcher config used, for hot-reload.
     pub last_config: Option<StoredPatcherConfig>,
+    /// The last failure of the session thread, kept for a reader of the status after the thread
+    /// ends. Cleared by the next start.
+    pub last_error: Option<PatcherError>,
 }
 
 impl PatcherStateInner {
@@ -104,6 +108,7 @@ impl PatcherStateInner {
             phase: PatcherPhase::Idle,
             overlay_progress: None,
             last_config: None,
+            last_error: None,
         }
     }
 
@@ -126,10 +131,16 @@ impl PatcherStateInner {
     pub fn begin_session(&mut self, origin: SessionOrigin) {
         self.phase = PatcherPhase::Building;
         self.overlay_progress = None;
+        self.last_error = None;
         self.session = Some(PatcherSession {
             origin,
             overlay_prefix: None,
         });
+    }
+
+    /// Keep `error` for a reader that asks after the session thread has ended.
+    pub fn record_error(&mut self, error: PatcherError) {
+        self.last_error = Some(error);
     }
 
     /// Ask the running session to rebuild its overlay from the library. Idle, it
@@ -212,6 +223,19 @@ mod tests {
 
         inner.enter_patching("prefix".to_string());
         assert!(inner.overlay_progress.is_none());
+    }
+
+    #[test]
+    fn a_start_clears_the_last_error_and_the_end_keeps_it() {
+        let mut inner = PatcherStateInner::new();
+        inner.record_error(PatcherError::BuildFailed {
+            message: "no game path".to_string(),
+        });
+        inner.end_session();
+        assert!(inner.last_error.is_some(), "the status must still name it");
+
+        inner.begin_session(SessionOrigin::Library);
+        assert!(inner.last_error.is_none());
     }
 
     #[test]

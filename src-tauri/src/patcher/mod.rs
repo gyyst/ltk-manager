@@ -14,7 +14,9 @@ pub mod delivery;
 pub mod thread;
 
 pub use delivery::PatcherDeliveryState;
-pub use ltk_manager_core::patching::{PatcherThread, PreparedHost, SessionParams, SessionStores};
+pub use ltk_manager_core::patching::{
+    PatcherThread, PreparedHost, SessionParams, SessionStores, StageHost,
+};
 pub use ltk_manager_runtime::patcher::{
     host, injector, session, PatcherError, PatcherEvents, PatcherPhase, PatcherSession,
     PatcherStateInner, SessionOrigin, StoredPatcherConfig,

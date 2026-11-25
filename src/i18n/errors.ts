@@ -294,6 +294,13 @@ export function describePatcherError(error: PatcherError): ErrorCopy {
       title: m["patcher.MANAGER_ELEVATED.title"](),
       description: m["patcher.MANAGER_ELEVATED.description"](),
     }))
+    .with({ kind: "STAGING_REFUSED" }, () => ({
+      title: m["patcher.STAGING_REFUSED.title"](),
+      description: m["patcher.STAGING_REFUSED.description"](),
+    }))
+    .with({ kind: "BUILD_FAILED" }, ({ message }) =>
+      withDetail(m["patcher.BUILD_FAILED.title"](), message),
+    )
     .with({ kind: "DLL_UNAVAILABLE" }, ({ reason }) => ({
       title: m["patcher.DLL_UNAVAILABLE.title"](),
       description: deliveryFailureDescription(reason),

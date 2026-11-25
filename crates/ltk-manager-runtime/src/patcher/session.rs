@@ -8,8 +8,9 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::Duration;
 
 use chrono::Utc;
 use ltk_manager_base::hashing::OverlayFingerprint;
@@ -20,10 +21,17 @@ use crate::diagnostics::ids::LogIds;
 use crate::diagnostics::incident::{GameRecord, SessionFailure};
 
 use super::events::PatcherEvents;
-use super::host::{HostConfig, HostError, HostLine, PatcherHost};
-use super::injector::{Injector, InjectorError, InjectorEvent, SessionEnd};
+use super::host::{
+    HostConfig, HostError, HostEvent, HostLine, HostState, PatcherHost, parse_event,
+};
+use super::injector::{
+    Injector, InjectorError, InjectorEvent, SessionEnd, unexpected_exit_message,
+};
 use super::recorder::GameRecorder;
 use super::refresh::OverlayRefresh;
+
+/// How often a host start checks for its first line or a stop request.
+const HOST_READY_POLL: Duration = Duration::from_millis(100);
 
 /// Fatal error from one injection session.
 #[derive(Debug, thiserror::Error)]
@@ -131,29 +139,115 @@ pub fn normalize_overlay_prefix(prefix: &str) -> String {
     normalized
 }
 
-/// Run one injection session against the persistent host, blocking until
-/// `stop_flag` is set or `refresh` asks for a rebuild with no game open.
+/// A host that answered the session's commands, with the line it answered with.
 ///
-/// Ensures a usable host (spawning or respawning as needed), configures it,
-/// starts the scan, and drives the injector's event loop. On exit the host's
-/// event stream is handed back for reuse by the next session - unless the host
-/// died, in which case it is cleared so the next start respawns.
-pub fn run_injection_session(
+/// A session hands this to [`run_injection_session`]. A caller that stops the host before
+/// it answers gets `None` instead, and never sees a session.
+pub struct StartedHost {
+    /// The first protocol line the host wrote.
+    first_line: String,
+    /// The host's stdout stream, still owned by the session.
+    events: Receiver<HostLine>,
+}
+
+/// Starts the session's host and waits until it answers the commands it was sent.
+///
+/// A host spawned with `--elevate` raises its UAC prompt after the spawn, so waiting for
+/// the first line keeps the session out of `patching` while the prompt is open or after a
+/// dismissal. Returns `None` if the caller stopped the session first.
+///
+/// A host that dies before it answers is shut down and reported as an error that names
+/// the dismissed prompt on the elevated path.
+pub fn start_injection_host(
     host: &Arc<Mutex<Option<PatcherHost>>>,
     injector_exe: &Path,
     elevate: bool,
     config: &HostConfig,
     stop_flag: &AtomicBool,
+) -> Result<Option<StartedHost>, HostError> {
+    let events = ensure_host_started(host, injector_exe, elevate, config)?;
+
+    match wait_for_start_line(&events, stop_flag, elevate) {
+        Ok(Some(first_line)) => Ok(Some(StartedHost { first_line, events })),
+        Ok(None) => {
+            shut_down(host);
+            Ok(None)
+        }
+        Err(error) => {
+            shut_down(host);
+            Err(error)
+        }
+    }
+}
+
+/// Reads the host's stream until the host answers or the caller stops the session.
+///
+/// Returns the answer, or `None` if `stop_flag` was set first. Skips lines that are not
+/// protocol events, because a host may print a banner before it reads its commands.
+fn wait_for_start_line(
+    events: &Receiver<HostLine>,
+    stop_flag: &AtomicBool,
+    elevate: bool,
+) -> Result<Option<String>, HostError> {
+    loop {
+        if stop_flag.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+
+        match events.recv_timeout(HOST_READY_POLL) {
+            Ok(Ok(line)) => match parse_event(&line) {
+                Some(HostEvent::Error { message, .. }) => return Err(HostError::Protocol(message)),
+                Some(HostEvent::Status {
+                    state: HostState::Failed,
+                    message,
+                    ..
+                }) => return Err(HostError::Protocol(message)),
+                Some(_) => return Ok(Some(line)),
+                None => tracing::debug!("[ltk-host] line before ready: {line}"),
+            },
+            Ok(Err(error)) => {
+                return Err(HostError::ExitedBeforeReady {
+                    message: unexpected_exit_message(elevate, Some(error.to_string())),
+                });
+            }
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(HostError::ExitedBeforeReady {
+                    message: unexpected_exit_message(elevate, None),
+                });
+            }
+        }
+    }
+}
+
+/// Drops the host in `slot`, if one is there, so a failed or stopped start leaves no process.
+fn shut_down(host: &Arc<Mutex<Option<PatcherHost>>>) {
+    if let Some(mut host) = host.lock().take() {
+        host.shutdown();
+    }
+}
+
+/// Run one injection session against a host that answered its commands, blocking until
+/// `stop_flag` is set or `refresh` asks for a rebuild with no game open.
+///
+/// Drives the injector's event loop. On exit the host's event stream is handed back for
+/// reuse by the next session - unless the host died, in which case it is cleared so the
+/// next start respawns.
+pub fn run_injection_session(
+    started: StartedHost,
+    host: &Arc<Mutex<Option<PatcherHost>>>,
+    elevate: bool,
+    stop_flag: &AtomicBool,
     refresh: &OverlayRefresh,
     observer: Arc<SessionObserver>,
 ) -> Result<SessionEnd, SessionError> {
-    let host_lines = ensure_host_started(host, injector_exe, elevate, config)?;
+    let StartedHost { first_line, events } = started;
 
     // Blocks until the game closes or the patcher is stopped.
     let (result, host_lines) = Injector::new()
         .with_elevate(elevate)
         .on_event(move |event| observer.observe(event))
-        .run_session(host_lines, host, stop_flag, refresh);
+        .run_session(Some(first_line), events, host, stop_flag, refresh);
 
     // Hand the event stream back to the host so the next session reuses it -
     // unless the host died, in which case clear it so the next start respawns.
@@ -639,5 +733,78 @@ mod tests {
     fn normalize_overlay_prefix_keeps_existing_separator() {
         let prefix = format!("overlay{}", std::path::MAIN_SEPARATOR);
         assert_eq!(normalize_overlay_prefix(&prefix), prefix);
+    }
+
+    /// A line that parses as no protocol event is not the host's answer, because the
+    /// `--elevate` wrapper can print a banner before it raises the prompt.
+    #[test]
+    fn wait_for_start_line_skips_a_line_that_is_not_a_protocol_event() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok("host starting".to_string())).unwrap();
+        tx.send(Ok("ok 0.1 config prefix set".to_string())).unwrap();
+        let stop = AtomicBool::new(false);
+
+        let line = wait_for_start_line(&rx, &stop, true).unwrap();
+
+        assert_eq!(line.as_deref(), Some("ok 0.1 config prefix set"));
+    }
+
+    #[test]
+    fn wait_for_start_line_reports_a_host_error() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok("error 0.2 prefix not configured".to_string()))
+            .unwrap();
+        let stop = AtomicBool::new(false);
+
+        let error =
+            wait_for_start_line(&rx, &stop, false).expect_err("an error line fails the start");
+
+        assert!(
+            error.to_string().contains("prefix not configured"),
+            "got: {error}"
+        );
+    }
+
+    /// A host that fails before it scans must not be accepted as ready, or the session would
+    /// claim `patching` for the failure.
+    #[test]
+    fn wait_for_start_line_reports_a_failed_status() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok("status 0.3 failed failed to load hook dll".to_string()))
+            .unwrap();
+        let stop = AtomicBool::new(false);
+
+        let error =
+            wait_for_start_line(&rx, &stop, false).expect_err("a failed status fails the start");
+
+        assert!(
+            error.to_string().contains("failed to load hook dll"),
+            "got: {error}"
+        );
+    }
+
+    /// A dismissed prompt closes the host's stdout before any answer, so the elevated
+    /// path must name the prompt rather than antivirus.
+    #[test]
+    fn wait_for_start_line_names_the_uac_prompt_when_the_host_disconnects() {
+        let (tx, rx) = mpsc::channel::<HostLine>();
+        drop(tx);
+        let stop = AtomicBool::new(false);
+
+        let error =
+            wait_for_start_line(&rx, &stop, true).expect_err("a closed stream fails the start");
+
+        assert!(
+            error.to_string().contains("User Account Control"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn wait_for_start_line_returns_none_after_a_stop_request() {
+        let (_tx, rx) = mpsc::channel::<HostLine>();
+        let stop = AtomicBool::new(true);
+
+        assert!(wait_for_start_line(&rx, &stop, false).unwrap().is_none());
     }
 }

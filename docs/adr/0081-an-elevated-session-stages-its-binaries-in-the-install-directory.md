@@ -30,6 +30,22 @@ executable, `--stage-elevated-patcher`, which holds the token the UAC prompt gra
 then verifies the copy while still unelevated: the DLL hashes to the digest, and the directory
 refuses a write.
 
+**The UAC prompt follows the overlay build.** The session prepares the delivered build first,
+builds the overlay, and only then runs the staging helper. A build that fails raises no prompt, and
+a dismissed prompt leaves no half-started session. A rebuild reuses the staged host, so no later
+build raises a second prompt.
+
+**A staging refusal is its own error.** The manager reports `STAGING_REFUSED` when the install
+directory is not under `Program Files` or its copy is writable, so the reader is told to move the
+install instead of turning off League's administrator setting.
+
+**The patching phase follows the host's first answer.** The session claims `patching` only after
+the host answers the config and scan commands it was sent. An elevated host raises its UAC prompt
+after it is spawned, so claiming the phase earlier would expose `patching` while the prompt is
+still open. A dismissed prompt would then look like a session that started and stopped. A host
+that dies before it answers now ends the start in the building phase with an error that names the
+prompt.
+
 **The manager refuses to elevate itself.** A start still fails when the manager runs elevated,
 because a host it spawns inherits high integrity without the staging step and would load the app
 data DLL.
@@ -40,8 +56,17 @@ refuses a start.
 
 ## Consequences
 
-**A WeGame client can be patched.** The reader accepts one UAC prompt per patcher start. A
-dismissed prompt ends the session with an error that names the prompt.
+**A WeGame client can be patched.** The reader accepts one UAC prompt per patcher start for the
+staging helper, plus one for the first host spawn of a manager run. A dismissed prompt ends the
+session with an error that names the prompt.
+
+**A failed build fails before the prompt.** A missing game path, an unavailable DLL or a failed
+overlay build ends the start with its own error, and the reader sees no UAC prompt for work that
+could not have run.
+
+**A failed start stays readable after the thread ends.** The patcher status carries the last
+failure, cleared by the next start, so an embedder that polls the status can tell a dismissed
+prompt, a refused staging and a failed build apart without reading the log.
 
 **The staging directory is a new location under the install directory.** A per-machine install
 puts it under `Program Files`, where ADR-0055's ACL already covers it. An install elsewhere fails

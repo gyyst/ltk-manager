@@ -7353,15 +7353,25 @@ export type PatcherError =
 { kind: "ALREADY_RUNNING" } | 
 /**  A stop was requested while nothing was running. */
 { kind: "NOT_RUNNING" } | { kind: "UNSUPPORTED_PLATFORM" } | 
-/**  League is set to run as administrator, and a session runs unelevated. */
-{ kind: "LEAGUE_ELEVATED" } | 
+/**
+ *  League is set to run as administrator. Older managers refuse a start in this situation.
+ *  The current manager stages an elevated host instead.
+ */
+{ kind: "LEAGUE_ELEVATED" } |
 /**  LTK Manager runs as administrator, and a session runs unelevated. */
-{ kind: "MANAGER_ELEVATED" } | 
+{ kind: "MANAGER_ELEVATED" } |
+/**
+ *  The install directory cannot hold a copy of the host and DLL that an elevated session may
+ *  load. `message` names the directory rule and the way out.
+ */
+{ kind: "STAGING_REFUSED"; message: string } |
+/**  The overlay could not be built, so no host ran. `message` is the build's own words. */
+{ kind: "BUILD_FAILED"; message: string } |
 /**
  *  No patcher DLL could be selected for the session. `reason` is the delivery failure's
  *  kind, which the frontend turns into copy.
  */
-{ kind: "DLL_UNAVAILABLE"; reason: DeliveryFailure } | 
+{ kind: "DLL_UNAVAILABLE"; reason: DeliveryFailure } |
 /**
  *  One injection session failed. `stage` separates a host that never came up
  *  from a game that was never patched, since they call for different advice.
@@ -7401,6 +7411,8 @@ export type PatcherStatus = {
 	 *  until the first report of one.
 	 */
 	overlayProgress: OverlayProgress | null,
+	/**  The last failure of the session thread. Cleared by the next start. */
+	error: PatcherError | null,
 };
 
 /**  A release newer than the running build. */

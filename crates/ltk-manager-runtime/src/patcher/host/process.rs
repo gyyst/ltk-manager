@@ -21,6 +21,11 @@ pub enum HostError {
     StdinClosed,
     #[error("Host stdout closed unexpectedly")]
     StdoutClosed,
+    #[error("{message}")]
+    ExitedBeforeReady {
+        /// What happened, in words a reader of the patcher status can act on.
+        message: String,
+    },
     #[error("Host reported error: {0}")]
     Protocol(String),
 }

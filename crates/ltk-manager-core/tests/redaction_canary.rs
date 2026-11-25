@@ -267,6 +267,12 @@ impl Fixture {
                         exe,
                         binaries: PatcherBinaries::default(),
                         advisories,
+                        delivery: StagedPatcher {
+                            dir: PathBuf::from("delivered"),
+                            version: "1.0.0".to_owned(),
+                            digest: "ab".repeat(32),
+                            eol: 1_800_000_000,
+                        },
                     })
                 }),
                 true,
@@ -550,10 +556,12 @@ impl Fixture {
         };
         let params = SessionParams {
             prepare_host,
+            stage_host: None,
             config: self.config.clone(),
             library: library.clone(),
             workshop_projects: Vec::new(),
             host_flags: 0,
+            should_elevate: false,
             stores: self.stores(),
             force_rebuild: false,
             telemetry: telemetry.clone(),

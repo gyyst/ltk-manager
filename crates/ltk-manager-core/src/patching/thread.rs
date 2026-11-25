@@ -23,6 +23,7 @@ use ltk_manager_runtime::diagnostics::ids::LogIds;
 use ltk_manager_runtime::diagnostics::incident::SessionFailure;
 use ltk_manager_runtime::diagnostics::telemetry;
 use ltk_manager_runtime::launcher::is_game_running;
+use ltk_manager_runtime::patcher::delivery::StagedPatcher;
 
 use super::pipeline::{IncidentPipeline, SessionStores};
 use ltk_manager_runtime::patcher::error::PatcherError;
@@ -65,15 +66,27 @@ pub struct PreparedHost {
     /// The advisories that the delivery of the patcher raised. Each build of the session
     /// records them.
     pub advisories: Advisories,
+    /// The delivered build, kept so an elevated session can stage it without downloading it
+    /// again.
+    pub delivery: StagedPatcher,
 }
 
 /// Prepares the host of a session on the session thread, because it can wait for a download.
 pub type PrepareHost = Box<dyn FnOnce() -> AppResult<PreparedHost> + Send>;
 
+/// Stages the prepared host where an elevated session may load it.
+///
+/// An elevated session runs this once, after the first overlay build, so no UAC prompt appears
+/// before the work that can fail without one. Returns the host whose binaries are staged.
+pub type StageHost = Box<dyn FnOnce(PreparedHost) -> AppResult<PreparedHost> + Send>;
+
 /// Per-session inputs for [`PatcherThread::start`], resolved by the caller
 /// before the patcher state is claimed.
 pub struct SessionParams {
     pub prepare_host: PrepareHost,
+    /// The staging step of a session that runs its host at high integrity, or `None` when it
+    /// runs at the manager's integrity.
+    pub stage_host: Option<StageHost>,
     pub config: Config,
     pub library: ModLibrary,
     pub workshop_projects: Vec<WorkshopTestProject>,
@@ -101,8 +114,31 @@ pub struct PatcherThread {
     workshop_projects: Vec<WorkshopTestProject>,
     host_flags: u32,
     should_elevate: bool,
+    stage_host: Option<StageHost>,
     force_rebuild: bool,
     telemetry: Telemetry,
+}
+
+/// Builds the first overlay and then stages the host.
+///
+/// An elevated session stages its host here rather than before the build, so the UAC
+/// prompt appears only after the build succeeded and a failed build raises no prompt.
+/// Returns `None` if the build failed or the caller stopped the session first.
+fn build_and_stage(
+    build: impl FnOnce() -> Option<String>,
+    host: PreparedHost,
+    stage: Option<StageHost>,
+) -> AppResult<Option<(PreparedHost, String)>> {
+    let Some(overlay_prefix) = build() else {
+        return Ok(None);
+    };
+
+    let host = match stage {
+        Some(stage) => stage(host)?,
+        None => host,
+    };
+
+    Ok(Some((host, overlay_prefix)))
 }
 
 impl PatcherThread {
@@ -136,6 +172,7 @@ impl PatcherThread {
 
         let SessionParams {
             prepare_host,
+            stage_host,
             config,
             library,
             workshop_projects,
@@ -173,6 +210,7 @@ impl PatcherThread {
             workshop_projects,
             host_flags,
             should_elevate,
+            stage_host,
             force_rebuild,
             telemetry,
         };
@@ -183,19 +221,20 @@ impl PatcherThread {
         Ok(())
     }
 
-    fn run(self, prepare_host: PrepareHost) {
-        let host = match prepare_host() {
+    fn run(mut self, prepare_host: PrepareHost) {
+        let prepared = match prepare_host() {
             Ok(host) => host,
             Err(e) => {
                 tracing::error!(error = ?e, "Could not prepare the patcher host");
+                self.record_failure(&e);
                 self.report_prepare_failure(&e);
                 self.events.error(e);
                 self.reset_to_idle();
                 return;
             }
         };
-        self.observer.set_patcher(host.binaries);
-        let host_advisories = host.advisories;
+        let host_advisories = prepared.advisories.clone();
+        self.observer.set_patcher(prepared.binaries.clone());
 
         if self.stop_flag.load(Ordering::SeqCst) {
             tracing::info!("Stop requested while preparing the patcher host, exiting");
@@ -203,34 +242,63 @@ impl PatcherThread {
             return;
         }
 
-        let mut force_rebuild = self.force_rebuild;
+        let force_rebuild = self.force_rebuild;
+        let stage_host = self.stage_host.take();
+        let first = build_and_stage(
+            || self.build_overlay(force_rebuild, 0, &host_advisories),
+            prepared,
+            stage_host,
+        );
+        let (host, mut overlay_prefix) = match first {
+            Ok(Some(built)) => built,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::error!(error = ?e, "Could not stage the elevated patcher host");
+                self.record_failure(&e);
+                self.report_prepare_failure(&e);
+                self.events.error(e);
+                self.reset_to_idle();
+                return;
+            }
+        };
+        // A staged host has its own binaries; the delivered ones were recorded for the gap
+        // before staging.
+        self.observer.set_patcher(host.binaries.clone());
+
         let mut rebuilds = 0u64;
 
         loop {
-            let Some(overlay_prefix) =
-                self.build_overlay(force_rebuild, rebuilds, &host_advisories)
-            else {
-                return;
-            };
-            force_rebuild = false;
-
             if self.run_session(&host.exe, overlay_prefix) == SessionEnd::Stopped {
                 break;
             }
             rebuilds += 1;
             self.resume_building();
+
+            // The staged host is reused across rebuilds, so no rebuild raises a UAC prompt.
+            let Some(next) = self.build_overlay(false, rebuilds, &host_advisories) else {
+                return;
+            };
+            overlay_prefix = next;
         }
 
         self.reset_to_idle();
         tracing::info!("Patcher thread exiting");
     }
 
-    /// Reports a start that got no host, by the delivery failure's kind.
+    /// Keeps the domain failure of a start for a status reader after the thread ends.
+    fn record_failure(&self, error: &AppError) {
+        if let Some(error) = error.domain::<PatcherError>() {
+            self.state.lock().record_error(error.clone());
+        }
+    }
+
+    /// Reports a start that got no host, by the delivery or staging failure's kind.
     ///
-    /// A failure that is not a `DllUnavailable` reports as `other`.
+    /// A failure that is not a `DllUnavailable` or a `StagingRefused` reports as `other`.
     fn report_prepare_failure(&self, error: &AppError) {
         let reason = match error.domain::<PatcherError>() {
             Some(PatcherError::DllUnavailable { reason }) => reason.as_str(),
+            Some(PatcherError::StagingRefused { .. }) => "staging-refused",
             _ => "other",
         };
         self.telemetry.track(
@@ -266,10 +334,14 @@ impl PatcherThread {
             }
             Err(e) => {
                 tracing::error!(error = ?e, "Overlay build failed");
+                let message = message_with_sources(&e);
+                self.state.lock().record_error(PatcherError::BuildFailed {
+                    message: message.clone(),
+                });
                 self.observer.session_failed(SessionFailure::Build {
                     kind: e.kind(),
                     category: e.overlay_category(),
-                    message: message_with_sources(&e),
+                    message,
                 });
                 self.events.error(e);
                 self.reset_to_idle();
@@ -307,11 +379,13 @@ impl PatcherThread {
     /// Run one injection session via the core orchestration, blocking until the
     /// caller stops or a library edit asks for a rebuild. A failure is reported
     /// and ends the session.
+    ///
+    /// The session claims the patching phase only once the host answers its commands, so
+    /// an embedder that polls the status never sees `patching` while the UAC prompt of an
+    /// elevated host is still open. A dismissed prompt ends the start before the claim.
     fn run_session(&self, host_exe: &Path, overlay_prefix: String) -> SessionEnd {
-        self.enter_patching(overlay_prefix.clone());
-
         let host_config = HostConfig {
-            prefix: overlay_prefix,
+            prefix: overlay_prefix.clone(),
             log_level: if self.config.verbose_patcher_logging {
                 HostLogLevel::Debug
             } else {
@@ -320,11 +394,29 @@ impl PatcherThread {
             flags: self.host_flags,
         };
 
-        let result = session::run_injection_session(
+        let started = session::start_injection_host(
             &self.host,
             host_exe,
             self.should_elevate,
             &host_config,
+            &self.stop_flag,
+        );
+
+        let started = match started {
+            Ok(Some(started)) => started,
+            Ok(None) => {
+                tracing::info!("Stop requested while starting the injection host");
+                return SessionEnd::Stopped;
+            }
+            Err(e) => return self.fail_session(SessionError::Host(e)),
+        };
+
+        self.enter_patching(overlay_prefix);
+
+        let result = session::run_injection_session(
+            started,
+            &self.host,
+            self.should_elevate,
             &self.stop_flag,
             &self.refresh,
             Arc::clone(&self.observer),
@@ -337,24 +429,26 @@ impl PatcherThread {
                 self.observer.session_stopped();
                 SessionEnd::Stopped
             }
-            Err(e) => {
-                match &e {
-                    SessionError::Host(err) => {
-                        tracing::error!("Failed to start injection host: {}", err)
-                    }
-                    SessionError::Injector(err) => tracing::error!("Injector error: {}", err),
-                }
-                let error = PatcherError::from(e);
-                if let PatcherError::InjectionFailed { stage, message } = &error {
-                    self.observer.session_failed(SessionFailure::Injection {
-                        stage: *stage,
-                        message: message.clone(),
-                    });
-                }
-                self.events.error(AppError::from(error));
-                SessionEnd::Stopped
-            }
+            Err(e) => self.fail_session(e),
         }
+    }
+
+    /// Reports a session that could not start or run, and ends it.
+    fn fail_session(&self, error: SessionError) -> SessionEnd {
+        match &error {
+            SessionError::Host(err) => tracing::error!("Failed to start injection host: {}", err),
+            SessionError::Injector(err) => tracing::error!("Injector error: {}", err),
+        }
+        let error = PatcherError::from(error);
+        if let PatcherError::InjectionFailed { stage, message } = &error {
+            self.observer.session_failed(SessionFailure::Injection {
+                stage: *stage,
+                message: message.clone(),
+            });
+        }
+        self.state.lock().record_error(error.clone());
+        self.events.error(AppError::from(error));
+        SessionEnd::Stopped
     }
 
     /// Reports how long a build took, by the bucket of each part.

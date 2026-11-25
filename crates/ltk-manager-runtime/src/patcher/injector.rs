@@ -176,7 +176,7 @@ impl Injector {
     /// Sets the integrity level that the session's host runs at.
     ///
     /// The flag only selects the hint of an unexpected exit, because the host is spawned by
-    /// [`ensure_host_started`](super::session::run_injection_session) with the same value.
+    /// [`start_injection_host`](super::session::start_injection_host) with the same value.
     pub fn with_elevate(mut self, elevate: bool) -> Self {
         self.elevate = elevate;
         self
@@ -203,28 +203,39 @@ impl Injector {
     /// until the session ends. On stop (or an auto-stop from a failed WAD scan)
     /// we send `stop` to the host over `host` but leave the process running.
     ///
+    /// `first` is the line the caller read while waiting for the host to answer
+    /// the commands it was sent. It is dispatched before the stream so the wait
+    /// loses no event.
+    ///
     /// Returns the event stream so the caller can hand it back to the host for
     /// the next session (see [`PatcherHost::restore_events`]).
     pub fn run_session(
         &self,
+        first: Option<String>,
         events: Receiver<HostLine>,
         host: &Arc<Mutex<Option<PatcherHost>>>,
         stop_flag: &AtomicBool,
         refresh: &OverlayRefresh,
     ) -> (Result<SessionEnd, InjectorError>, Receiver<HostLine>) {
-        let result = self.event_loop(&events, host, stop_flag, refresh);
+        let result = self.event_loop(first, &events, host, stop_flag, refresh);
         (result, events)
     }
 
     /// Read and dispatch events from the host until the session is over.
     fn event_loop(
         &self,
+        first: Option<String>,
         rx: &Receiver<HostLine>,
         control: &dyn SessionControl,
         stop_flag: &AtomicBool,
         refresh: &OverlayRefresh,
     ) -> Result<SessionEnd, InjectorError> {
         let mut state = SessionState::default();
+
+        // The line that proved the host was up, read before this loop owned the stream.
+        if let Some(line) = first {
+            self.dispatch_line(&line, &mut state)?;
+        }
 
         loop {
             // Finalize the WAD-failure report once its collection window elapses,
@@ -492,21 +503,26 @@ impl Injector {
 
     /// Builds the error returned when the host process disappears without us
     /// asking it to stop.
-    ///
-    /// A dismissed UAC prompt is the usual cause of an elevated host that never reports, so
-    /// the elevated path names it instead of antivirus.
     fn unexpected_exit_error(&self, last_error: Option<String>) -> InjectorError {
-        let base = if self.elevate {
-            "The injection host exited unexpectedly. If you dismissed the Windows User Account Control prompt, the host cannot run elevated, so accept the prompt the next time."
-        } else {
-            "The injection host exited unexpectedly. It may have crashed or been blocked by antivirus."
-        };
-        match last_error {
-            Some(detail) if !detail.is_empty() => {
-                InjectorError::Failed(format!("{base} (host reported: {detail})"))
-            }
-            _ => InjectorError::Failed(base.to_string()),
+        InjectorError::Failed(unexpected_exit_message(self.elevate, last_error))
+    }
+}
+
+/// The message of a host that ended before the session could use it.
+///
+/// A dismissed UAC prompt is the usual cause of an elevated host that never reports, so
+/// the elevated path names it instead of antivirus.
+pub(crate) fn unexpected_exit_message(elevate: bool, last_error: Option<String>) -> String {
+    let base = if elevate {
+        "The injection host exited unexpectedly. If you dismissed the Windows User Account Control prompt, the host cannot run elevated, so accept the prompt the next time."
+    } else {
+        "The injection host exited unexpectedly. It may have crashed or been blocked by antivirus."
+    };
+    match last_error {
+        Some(detail) if !detail.is_empty() => {
+            format!("{base} (host reported: {detail})")
         }
+        _ => base.to_string(),
     }
 }
 
@@ -680,9 +696,13 @@ mod tests {
                 std::thread::sleep(Duration::from_secs(10));
                 watchdog_flag.store(true, Ordering::SeqCst);
             });
-            let result =
-                self.injector
-                    .event_loop(&self.rx, &self.control, &self.stop_flag, &self.refresh);
+            let result = self.injector.event_loop(
+                None,
+                &self.rx,
+                &self.control,
+                &self.stop_flag,
+                &self.refresh,
+            );
             drop(watchdog);
             result
         }
@@ -727,6 +747,26 @@ mod tests {
             harness.control.was_stopped(),
             "a requested stop must be forwarded to the host"
         );
+    }
+
+    /// The line that proved the host was up is dispatched before the stream, so a failure
+    /// it carries still ends the session instead of being dropped by the handover.
+    #[test]
+    fn event_loop_dispatches_the_first_line_before_the_stream() {
+        let harness = Harness::new();
+
+        let err = harness
+            .injector
+            .event_loop(
+                Some("status 0.5 failed the host refused the session".to_string()),
+                &harness.rx,
+                &harness.control,
+                &harness.stop_flag,
+                &harness.refresh,
+            )
+            .expect_err("a failed status must end the session");
+
+        assert!(err.to_string().contains("the host refused the session"));
     }
 
     /// A dismissed UAC prompt looks the same as a crash to the channel, so the elevated path

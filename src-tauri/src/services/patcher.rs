@@ -9,7 +9,7 @@ use crate::patcher::thread::TauriPatcherEvents;
 use crate::patcher::{
     PatcherDeliveryState, PatcherError, PatcherEvents, PatcherHostState, PatcherPhase,
     PatcherSession, PatcherState, PatcherThread, PreparedHost, SessionParams, SessionStores,
-    StoredPatcherConfig,
+    StageHost, StoredPatcherConfig,
 };
 use crate::state::{GameStoreState, IncidentStoreState, SettingsState};
 use ltk_manager_base::advisory::Advisories;
@@ -77,6 +77,8 @@ pub struct PatcherStatus {
     /// The last progress the build phase reported. `null` outside the build phase, and
     /// until the first report of one.
     pub overlay_progress: Option<OverlayProgress>,
+    /// The last failure of the session thread. Cleared by the next start.
+    pub error: Option<PatcherError>,
 }
 
 /// Resolve a bundled resource file (e.g. the injector executable) from the
@@ -251,14 +253,14 @@ pub(crate) fn start_patcher_inner(
 
     let channel = crate::patcher::delivery::channel(&config_snapshot);
     let prepare_events = Arc::clone(&events);
-    let prepare_host = Box::new(move || {
-        prepare_host(
-            &delivery,
-            channel,
-            &injector_exe,
-            should_elevate,
-            &*prepare_events,
-        )
+    let prepare_injector = injector_exe.clone();
+    let prepare_host =
+        Box::new(move || prepare_host(&delivery, channel, &prepare_injector, &*prepare_events));
+    // A session stages its host only after the overlay build, so a failed build raises no UAC
+    // prompt. An unelevated session has no staging step at all.
+    let stage_host: Option<StageHost> = should_elevate.then(|| {
+        let bundled_host = injector_exe;
+        Box::new(move |host| stage_prepared_host(host, &bundled_host)) as StageHost
     });
     let stores = SessionStores {
         // The cap is a setting, so the session's store reads it as a snapshot.
@@ -279,6 +281,7 @@ pub(crate) fn start_patcher_inner(
         stored_config,
         SessionParams {
             prepare_host,
+            stage_host,
             config: config_snapshot,
             library: library.0.clone(),
             workshop_projects,
@@ -294,12 +297,12 @@ pub(crate) fn start_patcher_inner(
 /// Selects the delivered build of a session and identifies its binaries.
 ///
 /// Reports the delivery as a build step through `events` when it has to wait for the network.
-/// Fails with [`PatcherError::DllUnavailable`] if no build is usable.
+/// Does not stage an elevated session: the session thread runs that step after the overlay
+/// build. Fails with [`PatcherError::DllUnavailable`] if no build is usable.
 fn prepare_host(
     delivery: &PatcherDeliveryState,
     channel: Channel,
     bundled_host: &Path,
-    elevated: bool,
     events: &dyn PatcherEvents,
 ) -> AppResult<PreparedHost> {
     let staged = delivery
@@ -318,19 +321,7 @@ fn prepare_host(
         "Using the delivered patcher DLL"
     );
 
-    let staged = if elevated {
-        stage_elevated(&staged, bundled_host)?
-    } else {
-        staged
-    };
-
-    let exe = staged.dir.join(HOST_EXE_NAME);
-    let binaries = PatcherBinaries::identify(
-        &staged.dir.join(HOOK_DLL_NAME),
-        &exe,
-        &staged.digest[..BINARY_HASH_LEN],
-        option_env!("LTK_BUNDLED_HOST_HASH").unwrap_or_default(),
-    );
+    let (exe, binaries) = identify_host(&staged);
 
     let mut advisories = Advisories::default();
     delivery.raise_failed_check(&mut advisories);
@@ -339,19 +330,47 @@ fn prepare_host(
         exe,
         binaries,
         advisories,
+        delivery: staged,
     })
 }
 
-/// Copies a delivered build into the administrator-only install directory for an elevated
-/// session, and returns the verified copy.
+/// Returns the host path and the binary identity of a staged build.
+fn identify_host(staged: &StagedPatcher) -> (PathBuf, PatcherBinaries) {
+    let exe = staged.dir.join(HOST_EXE_NAME);
+    let binaries = PatcherBinaries::identify(
+        &staged.dir.join(HOOK_DLL_NAME),
+        &exe,
+        &staged.digest[..BINARY_HASH_LEN],
+        option_env!("LTK_BUNDLED_HOST_HASH").unwrap_or_default(),
+    );
+
+    (exe, binaries)
+}
+
+/// Stages the prepared build in the administrator-only install directory for an elevated
+/// session, and returns the host that runs from the verified copy.
 ///
 /// A high-integrity host must not load the DLL from the app data directory, which the user can
 /// write, so the copy goes under the install directory and a UAC prompt runs it. Fails with
-/// [`PatcherError::LeagueElevated`] if the install directory is unprotected or its copy is
+/// [`PatcherError::StagingRefused`] if the install directory is unprotected or its copy is
 /// writable, and with [`PatcherError::InjectionFailed`] if the copy does not verify.
+fn stage_prepared_host(host: PreparedHost, bundled_host: &Path) -> AppResult<PreparedHost> {
+    let staged = stage_elevated(&host.delivery, bundled_host)?;
+    let (exe, binaries) = identify_host(&staged);
+
+    Ok(PreparedHost {
+        exe,
+        binaries,
+        advisories: host.advisories,
+        delivery: staged,
+    })
+}
+
+/// Copies a delivered build into the administrator-only install directory and returns the
+/// verified copy.
 fn stage_elevated(staged: &StagedPatcher, bundled_host: &Path) -> AppResult<StagedPatcher> {
     use ltk_manager_runtime::patcher::staging::{
-        program_files_roots, stage_elevated as stage, StageRequest, StagingError,
+        program_files_roots, stage_elevated as stage, StageRequest,
     };
 
     let install_dir = std::env::current_exe()
@@ -367,19 +386,10 @@ fn stage_elevated(staged: &StagedPatcher, bundled_host: &Path) -> AppResult<Stag
         install_dir,
     };
 
-    let staged_elevated =
-        stage(&request, bundled_host, &program_files_roots()).map_err(|error| {
-            tracing::error!(%error, "Could not stage the elevated patcher");
-            match error {
-                // Both refusals leave the reader the same two ways out: remove League's elevation,
-                // or install the manager where its binaries are protected.
-                StagingError::InstallDirUnprotected { .. }
-                | StagingError::DirectoryWritable { .. } => PatcherError::LeagueElevated,
-                other => PatcherError::InjectionFailed {
-                    stage: ltk_manager_runtime::patcher::InjectionStage::Host,
-                    message: other.to_string(),
-                },
-            }
+    let staged_elevated = stage(&request, bundled_host, &program_files_roots())
+        .map_err(PatcherError::from)
+        .inspect_err(|error| {
+            tracing::error!(?error, "Could not stage the elevated patcher");
         })?;
 
     tracing::info!(
@@ -472,6 +482,7 @@ fn get_patcher_status_inner(state: &State<PatcherState>) -> PatcherStatus {
             } else {
                 None
             },
+            error: patcher_state.last_error.clone(),
         }
     })
 }

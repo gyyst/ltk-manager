@@ -305,28 +305,23 @@ fn run_helper_copies_into_the_protected_install_directory() {
         install_dir: install.clone(),
     };
 
-    let staged = run_helper(&request, &bundled.join(HOST_EXE_NAME), &[install.clone()]).unwrap();
+    let staged = run_helper(
+        &request,
+        &bundled.join(HOST_EXE_NAME),
+        std::slice::from_ref(&install),
+    )
+    .unwrap();
 
     assert_eq!(staged.dir, install.join("patcher").join(&digest));
     assert_eq!(fs::read(staged.dir.join(HOOK_DLL_NAME)).unwrap(), dll_bytes);
 }
 
-/// The staging step never falls back to the app data DLL: a helper that reports success still
-/// fails when the copy does not verify.
+/// The staging step never falls back to the app data DLL: a copy that does not hash to
+/// its digest is rejected even when a helper reported success.
 #[test]
-fn stage_elevated_rejects_a_copy_that_does_not_verify() {
-    let source = temp_dir("stage-unverified-source");
-    let bundled = temp_dir("stage-unverified-bundled");
+fn verify_staged_rejects_a_copy_that_does_not_hash_to_its_digest() {
     let install = temp_dir("stage-unverified-install");
     let digest = digest_of(b"patcher dll");
-    fs::write(source.join(HOOK_DLL_NAME), b"patcher dll").unwrap();
-    fs::write(bundled.join(HOST_EXE_NAME), b"host exe").unwrap();
-
-    let request = StageRequest {
-        source,
-        digest: digest.clone(),
-        install_dir: install.clone(),
-    };
 
     // A helper that leaves a different DLL behind, as a failed copy would.
     let target = staging_dir(&install, &digest).unwrap();

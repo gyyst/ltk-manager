@@ -382,11 +382,16 @@ fn run_elevated_helper(request: &StageRequest) -> Result<(), StagingError> {
     // SAFETY: `info` is initialized and lives for the whole call.
     let launched = unsafe { ShellExecuteExW(&mut info) };
     if launched == 0 {
+        let error = std::io::Error::last_os_error();
+        // ERROR_CANCELLED: the reader dismissed the UAC prompt.
+        if error.raw_os_error() == Some(1223) {
+            return Err(StagingError::Helper {
+                message: "the user dismissed the User Account Control prompt".to_string(),
+            });
+        }
+
         return Err(StagingError::Helper {
-            message: format!(
-                "the elevated helper did not start, error {}",
-                std::io::Error::last_os_error()
-            ),
+            message: format!("the elevated helper did not start, error {error}"),
         });
     }
 

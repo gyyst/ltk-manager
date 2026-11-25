@@ -4,4 +4,6 @@ pub mod pipeline;
 pub mod thread;
 
 pub use pipeline::{IncidentPipeline, SessionStores};
-pub use thread::{PatcherThread, PrepareHost, PreparedHost, SessionParams, workshop_tests};
+pub use thread::{
+    PatcherThread, PrepareHost, PreparedHost, SessionParams, StageHost, workshop_tests,
+};
