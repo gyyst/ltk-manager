@@ -1,0 +1,158 @@
+name: Build installer for Sona
+
+# Builds the Windows NSIS installer for a Sona release. The Sona release workflow
+# calls this and takes the installer as an artifact; this workflow creates no
+# GitHub Release and publishes no updater manifest of its own.
+#
+# Two upstream behaviours are dropped here:
+# - The signing command is removed, so the installer and the bundled patcher host
+#   carry no Authenticode signature. LTK-PATCHER-LICENSE.md requires removing the
+#   League Toolkit signature from a redistributed host, and a fork has no
+#   certificate of its own to sign with.
+# - The updater endpoint is written by the caller, so a fork never points at the
+#   upstream releases.
+#
+# A fork has no attestation key, so the build downloads no patcher DLL and reads
+# the DLL that an official install has already staged under the data directory.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version to stamp into tauri.conf.json, without the v prefix"
+        required: true
+        type: string
+      updater_endpoint:
+        description: "Updater endpoint for this fork's latest.json; empty disables the updater"
+        required: false
+        type: string
+        default: ""
+      updater_pubkey:
+        description: "Tauri updater public key; required when updater_endpoint is set"
+        required: false
+        type: string
+        default: ""
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp into tauri.conf.json, without the v prefix"
+        required: true
+        type: string
+      updater_endpoint:
+        description: "Updater endpoint; empty disables the updater"
+        required: false
+        type: string
+        default: ""
+      updater_pubkey:
+        description: "Tauri updater public key; required when updater_endpoint is set"
+        required: false
+        type: string
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build installer
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: pnpm/action-setup@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sona-release
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Configure the bundle
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          UPDATER_ENDPOINT: ${{ inputs.updater_endpoint }}
+          UPDATER_PUBKEY: ${{ inputs.updater_pubkey }}
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const fs = require("fs");
+          const path = "src-tauri/tauri.conf.json";
+          const conf = JSON.parse(fs.readFileSync(path, "utf8"));
+
+          conf.version = process.env.VERSION;
+
+          // A fork has no certificate of its own, and the patcher licence requires
+          // removing the League Toolkit signature from a redistributed host.
+          delete conf.bundle.windows.signCommand;
+
+          // Without a signing key Tauri cannot emit updater artifacts.
+          const endpoint = (process.env.UPDATER_ENDPOINT || "").trim();
+          if (!endpoint) {
+            conf.bundle.createUpdaterArtifacts = false;
+            delete conf.plugins.updater;
+          } else {
+            if (!process.env.UPDATER_PUBKEY) {
+              throw new Error("updater_pubkey is required when updater_endpoint is set");
+            }
+            conf.plugins.updater.endpoints = [endpoint];
+            conf.plugins.updater.pubkey = process.env.UPDATER_PUBKEY;
+          }
+
+          fs.writeFileSync(path, JSON.stringify(conf, null, 2) + "\n");
+          NODE
+
+          # The version validator in release.yml reads this, and the installer name
+          # follows the package version.
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            pkg.version = process.env.VERSION;
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+      - name: Build the installer
+        env:
+          # No attestation key in a fork, so the build reads the DLL that an
+          # official install staged rather than downloading one.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build
+
+      - name: Collect the installer
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem -Path "target/release/bundle/nsis" -Filter "*-setup.exe" |
+            Select-Object -First 1
+          if (-not $setup) { throw "No NSIS installer was produced" }
+
+          New-Item -ItemType Directory -Force -Path artifacts/manager | Out-Null
+          $name = "LTK.Manager_${{ inputs.version }}_x64-setup.exe"
+          Copy-Item $setup.FullName "artifacts/manager/$name"
+          $item = Get-Item "artifacts/manager/$name"
+          Write-Host "$($item.Name): $($item.Length) bytes"
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ltk-manager-installer
+          path: artifacts/manager/
+          if-no-files-found: error
