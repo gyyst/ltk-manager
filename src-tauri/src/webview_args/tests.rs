@@ -258,7 +258,12 @@ fn without_values_cuts_a_switch_before_its_value() {
 
 #[test]
 fn inherited_new_splits_the_switches() {
-    let inherited = Inherited::new("--disable-gpu --remote-debugging-port=9222", true, vec![]);
+    let inherited = Inherited::new(
+        "--disable-gpu --remote-debugging-port=9222",
+        true,
+        vec![],
+        false,
+    );
 
     assert_eq!(
         inherited,
@@ -267,15 +272,66 @@ fn inherited_new_splits_the_switches() {
             dropped: strings(&["--remote-debugging-port=9222"]),
             launcher_port: true,
             overrides: vec![],
+            sona_ltf: false,
         }
     );
     assert!(inherited.is_debugging());
 }
 
 #[test]
+fn inherited_new_keeps_debugging_switches_on_a_sona_ltf_start() {
+    let inherited = Inherited::new(
+        "--disable-gpu --remote-debugging-port=9222 --remote-allow-origins=http://127.0.0.1:9222",
+        true,
+        vec![],
+        true,
+    );
+
+    assert_eq!(
+        inherited.kept,
+        strings(&[
+            "--disable-gpu",
+            "--remote-debugging-port=9222",
+            "--remote-allow-origins=http://127.0.0.1:9222",
+        ])
+    );
+    assert!(inherited.dropped.is_empty());
+    assert!(inherited.sona_ltf);
+}
+
+#[test]
+fn refused_debug_switch_is_none_on_a_sona_ltf_start() {
+    let line = r#""C:\WebView\msedgewebview2.exe" --embedded-browser-webview=1 --remote-debugging-port=9222"#;
+
+    assert_eq!(refused_debug_switch(line, true), None);
+    assert_eq!(
+        refused_debug_switch(line, false).as_deref(),
+        Some("--remote-debugging-port=9222")
+    );
+}
+
+#[test]
 fn inherited_is_not_empty_if_an_override_variable_was_set() {
-    let inherited = Inherited::new("", false, vec![OVERRIDE_VARS[0]]);
+    let inherited = Inherited::new("", false, vec![OVERRIDE_VARS[0]], false);
 
     assert!(!inherited.is_empty());
     assert!(!inherited.is_debugging());
+}
+
+#[test]
+fn inherited_is_not_empty_if_the_sona_marker_was_set() {
+    let inherited = Inherited::new("", false, vec![], true);
+
+    assert!(!inherited.is_empty());
+    assert!(!inherited.is_debugging());
+}
+
+#[test]
+fn take_inherited_reads_and_removes_the_sona_marker() {
+    std::env::set_var(SONA_LTF_BRIDGE, "1");
+
+    let inherited = take_inherited();
+
+    assert!(inherited.sona_ltf);
+    assert_eq!(std::env::var_os(SONA_LTF_BRIDGE), None);
 }

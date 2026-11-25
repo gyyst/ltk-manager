@@ -31,3 +31,15 @@ fn must_relaunch_is_true_under_another_parent() {
 fn must_relaunch_is_true_under_the_shell_if_debugging() {
     assert!(must_relaunch(Some(7), 7, true));
 }
+
+#[test]
+fn debugging_requires_relaunch_is_false_for_a_sona_ltf_start() {
+    let sona = Inherited::new("--remote-debugging-port=9222", true, vec![], true);
+    assert!(!debugging_requires_relaunch(&sona));
+
+    let launcher = Inherited::new("--remote-debugging-port=9222", true, vec![], false);
+    assert!(debugging_requires_relaunch(&launcher));
+
+    let clean = Inherited::new("--disable-gpu", false, vec![], false);
+    assert!(!debugging_requires_relaunch(&clean));
+}

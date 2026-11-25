@@ -36,8 +36,9 @@ const RELAUNCHED_ARG: &str = "--shell-relaunched";
 /// if `inherited` says a launcher tried to debug the frontend.
 ///
 /// A launcher can start the manager under explorer as a seeded parent, so a debugging launcher
-/// is restarted whatever the parent looks like. A copy never restarts, whatever its
-/// environment: a variable the shell itself carries would otherwise restart it forever.
+/// is restarted whatever the parent looks like. A Sona LTF start keeps the debugging port it
+/// asks for, so it does not restart. A copy never restarts, whatever its environment: a
+/// variable the shell itself carries would otherwise restart it forever.
 ///
 /// Returns `true` if the copy started and this process must exit. Returns `false` if no shell
 /// runs, if this process is already a copy, or if the start fails.
@@ -50,7 +51,7 @@ pub fn relaunch_if_needed(inherited: &Inherited) -> bool {
         return false;
     };
     let parent = parent_pid();
-    let debugging = inherited.is_debugging();
+    let debugging = debugging_requires_relaunch(inherited);
     if !must_relaunch(parent, shell, debugging) {
         return false;
     }
@@ -79,6 +80,12 @@ pub fn relaunch_if_needed(inherited: &Inherited) -> bool {
             false
         }
     }
+}
+
+/// Returns `true` if a launcher tried to debug the frontend, unless the Sona LTF launcher started
+/// the manager and keeps the port.
+fn debugging_requires_relaunch(inherited: &Inherited) -> bool {
+    inherited.is_debugging() && !inherited.sona_ltf
 }
 
 /// Returns `true` if `shell` is not `parent`, or if a launcher tried to debug the frontend.

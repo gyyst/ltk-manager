@@ -112,6 +112,7 @@ fn main() {
             dropped = ?webview_args::without_values(&inherited.dropped),
             launcher_port = inherited.launcher_port,
             overrides = ?inherited.overrides,
+            sona_ltf = inherited.sona_ltf,
             debugging = inherited.is_debugging(),
             "Inherited WebView2 browser arguments"
         );

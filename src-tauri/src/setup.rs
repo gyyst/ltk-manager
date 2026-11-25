@@ -277,7 +277,7 @@ fn create_main_window(app: &tauri::App) -> tauri::Result<tauri::WebviewWindow> {
     let window = builder.build()?;
 
     #[cfg(windows)]
-    crate::webview_args::verify_browser_process(&window)?;
+    crate::webview_args::verify_browser_process(&window, inherited.sona_ltf)?;
 
     Ok(window)
 }
