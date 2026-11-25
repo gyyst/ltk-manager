@@ -1,40 +1,60 @@
-//! The check that a patcher session runs unelevated.
+//! Decides whether a patcher session runs unelevated or through the UAC bridge.
 
 use super::error::PatcherError;
 use crate::diagnostics;
 
-/// Fails if the session would need or inherit high integrity.
-///
-/// Probes the running system, and the rule itself is `elevation_refusal`.
-pub fn check_unelevated() -> Result<(), PatcherError> {
-    let manager_elevated = diagnostics::manager_is_elevated();
-    let league_admin = diagnostics::league_configured_as_admin();
-    tracing::info!(manager_elevated, league_admin, "Patcher elevation check");
-
-    match elevation_refusal(league_admin, manager_elevated) {
-        Some(refusal) => {
-            let facts = diagnostics::elevation::facts();
-            let cause = facts.cause().map(|cause| cause.to_string());
-            tracing::warn!(%refusal, ?facts, cause, "Refusing to start the patcher");
-            Err(refusal)
-        }
-        None => Ok(()),
-    }
+/// How a session reaches League's process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElevationPlan {
+    /// The host runs as the manager does. League is not elevated, so injection crosses no
+    /// integrity boundary.
+    Unelevated,
+    /// The host runs at high integrity through `--elevate`, and loads its DLL from the
+    /// administrator-only install directory.
+    Elevated,
 }
 
-/// Returns the error for an elevated session, or `None` if the session is unelevated.
+/// Reads the running system and returns the plan for a session.
 ///
-/// The delivered DLL sits in a directory that the user can write, so a high-integrity host
-/// must not load it, per `docs/adr/0074-every-session-runs-a-delivered-patcher-dll.md`.
-fn elevation_refusal(league_admin: bool, manager_elevated: bool) -> Option<PatcherError> {
+/// Probes the system, so it can only be called for real. The rule itself is
+/// [`plan_elevation`].
+pub fn plan_for_system() -> Result<ElevationPlan, PatcherError> {
+    let manager_elevated = diagnostics::manager_is_elevated();
+    let league_admin = diagnostics::league_configured_as_admin();
+    let league_elevated = diagnostics::league_is_elevated();
+    tracing::info!(
+        manager_elevated,
+        league_admin,
+        league_elevated,
+        "Patcher elevation check"
+    );
+
+    plan_elevation(manager_elevated, league_admin, league_elevated).inspect_err(|refusal| {
+        let facts = diagnostics::elevation::facts();
+        let cause = facts.cause().map(|cause| cause.to_string());
+        tracing::warn!(%refusal, ?facts, cause, "Refusing to start the patcher");
+    })
+}
+
+/// Returns the plan for a session, or the error that refuses the start.
+///
+/// An elevated manager refuses the start: a host it spawns already runs at high integrity and
+/// would load a DLL from a directory the user can write, which ADR-0074 rules out. An
+/// unelevated manager elevates its host when League is elevated either by configuration or at
+/// runtime, and the host then loads the DLL from the install directory.
+fn plan_elevation(
+    manager_elevated: bool,
+    league_admin: bool,
+    league_elevated: bool,
+) -> Result<ElevationPlan, PatcherError> {
     if manager_elevated {
-        return Some(PatcherError::ManagerElevated);
+        return Err(PatcherError::ManagerElevated);
     }
-    if league_admin {
-        return Some(PatcherError::LeagueElevated);
+    if league_admin || league_elevated {
+        return Ok(ElevationPlan::Elevated);
     }
 
-    None
+    Ok(ElevationPlan::Unelevated)
 }
 
 #[cfg(test)]
@@ -43,25 +63,40 @@ mod tests {
     use assert_matches::assert_matches;
 
     #[test]
-    fn elevation_refusal_is_none_if_nothing_is_elevated() {
-        assert!(elevation_refusal(false, false).is_none());
-    }
-
-    #[test]
-    fn elevation_refusal_names_league_if_only_league_is_elevated() {
+    fn plan_is_unelevated_if_nothing_is_elevated() {
         assert_matches!(
-            elevation_refusal(true, false),
-            Some(PatcherError::LeagueElevated)
+            plan_elevation(false, false, false),
+            Ok(ElevationPlan::Unelevated)
         );
     }
 
     #[test]
-    fn elevation_refusal_names_manager_if_manager_is_elevated() {
+    fn plan_is_elevated_if_league_is_configured_as_admin() {
+        assert_matches!(
+            plan_elevation(false, true, false),
+            Ok(ElevationPlan::Elevated)
+        );
+    }
+
+    /// A client started by an elevated launcher sets no `RUNASADMIN` layer, so the runtime
+    /// check is what makes it patchable.
+    #[test]
+    fn plan_is_elevated_if_league_runs_elevated() {
+        assert_matches!(
+            plan_elevation(false, false, true),
+            Ok(ElevationPlan::Elevated)
+        );
+    }
+
+    #[test]
+    fn plan_refuses_an_elevated_manager() {
         for league_admin in [false, true] {
-            assert_matches!(
-                elevation_refusal(league_admin, true),
-                Some(PatcherError::ManagerElevated)
-            );
+            for league_elevated in [false, true] {
+                assert_matches!(
+                    plan_elevation(true, league_admin, league_elevated),
+                    Err(PatcherError::ManagerElevated)
+                );
+            }
         }
     }
 }

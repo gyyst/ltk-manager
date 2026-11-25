@@ -178,6 +178,55 @@ pub(crate) fn process_elevated(pid: u32) -> Option<bool> {
     probe::process_token(pid).and_then(|token| probe::elevated(&token))
 }
 
+/// Whether League runs at high integrity right now.
+///
+/// Covers a client started by an elevated launcher such as WeGame, which sets no
+/// `RUNASADMIN` layer. Returns `false` off Windows.
+pub fn league_process_elevated() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        league_process_elevated_from(
+            &|name| {
+                ritoclient::processes::list_matching(&[name])
+                    .into_iter()
+                    .next()
+                    .map(|(_, pid)| pid)
+            },
+            &|pid| process_elevated(pid),
+            &probe::open_process_denied,
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+/// Returns whether a League process is elevated.
+///
+/// Checks the client before the game: the client runs whenever the game does, and the game's
+/// process is protected by an anti-cheat driver that refuses a token read.
+///
+/// `pid_of` returns the pid of the first process with an executable name. `elevated` reads a
+/// token. `access_denied` reports whether opening the process was refused, which answers the
+/// same question because a higher integrity level refuses a plain caller.
+#[cfg(any(target_os = "windows", test))]
+fn league_process_elevated_from(
+    pid_of: &dyn Fn(&str) -> Option<u32>,
+    elevated: &dyn Fn(u32) -> Option<bool>,
+    access_denied: &dyn Fn(u32) -> bool,
+) -> bool {
+    const LEAGUE_PROCESSES: &[&str] = &[
+        "leagueclientux.exe",
+        "leagueclient.exe",
+        "league of legends.exe",
+    ];
+
+    LEAGUE_PROCESSES.iter().any(|name| {
+        pid_of(name).is_some_and(|pid| access_denied(pid) || elevated(pid).unwrap_or(false))
+    })
+}
+
 #[cfg(target_os = "windows")]
 mod probe {
     use std::mem::size_of;
@@ -185,7 +234,9 @@ mod probe {
     use std::ptr;
 
     use ltk_manager_base::platform::windows::owned_handle;
-    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, GetLastError};
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, GetLastError,
+    };
     use windows_sys::Win32::Security::{
         GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, PSID, TOKEN_ELEVATION,
         TOKEN_ELEVATION_TYPE, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
@@ -236,6 +287,24 @@ mod probe {
 
         // SAFETY: the token came from OpenProcessToken and nothing else holds it.
         unsafe { owned_handle(token) }
+    }
+
+    /// Returns whether opening the process `pid` for a query is refused with access denied.
+    ///
+    /// A process at a higher integrity level refuses the open, so this answers whether it is
+    /// elevated when its token cannot be read.
+    pub fn open_process_denied(pid: u32) -> bool {
+        // SAFETY: the call takes no pointer.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if !process.is_null() {
+            // SAFETY: the handle came from OpenProcess and nothing else holds it.
+            drop(unsafe { owned_handle(process) });
+            return false;
+        }
+
+        // SAFETY: the call takes no pointer.
+        let error = unsafe { GetLastError() };
+        error == ERROR_ACCESS_DENIED
     }
 
     /// Reads whether `token` is elevated.

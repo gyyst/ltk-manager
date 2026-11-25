@@ -17,7 +17,7 @@ use ltk_manager_base::events::{OverlayProgress, PrepareStep};
 use ltk_manager_base::utils::client_settings::LeagueClientSettings;
 use ltk_manager_base::utils::game::GameDir;
 use ltk_manager_runtime::diagnostics::binary_id::PatcherBinaries;
-use ltk_manager_runtime::patcher::delivery::Channel;
+use ltk_manager_runtime::patcher::delivery::{Channel, StagedPatcher};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -233,11 +233,15 @@ pub(crate) fn start_patcher_inner(
         }
     }
 
-    if let Err(refusal) = ltk_manager_runtime::patcher::check_unelevated() {
-        let facts = ltk_manager_runtime::diagnostics::elevation::facts();
-        telemetry.report_patcher_refused(&refusal, &facts);
-        return Err(refusal.into());
-    }
+    let plan = match ltk_manager_runtime::patcher::plan_for_system() {
+        Ok(plan) => plan,
+        Err(refusal) => {
+            let facts = ltk_manager_runtime::diagnostics::elevation::facts();
+            telemetry.report_patcher_refused(&refusal, &facts);
+            return Err(refusal.into());
+        }
+    };
+    let should_elevate = plan == ltk_manager_runtime::patcher::ElevationPlan::Elevated;
 
     let delivery = app_handle.state::<PatcherDeliveryState>().inner().clone();
     delivery.sync_in_background(&config_snapshot);
@@ -247,8 +251,15 @@ pub(crate) fn start_patcher_inner(
 
     let channel = crate::patcher::delivery::channel(&config_snapshot);
     let prepare_events = Arc::clone(&events);
-    let prepare_host =
-        Box::new(move || prepare_host(&delivery, channel, &injector_exe, &*prepare_events));
+    let prepare_host = Box::new(move || {
+        prepare_host(
+            &delivery,
+            channel,
+            &injector_exe,
+            should_elevate,
+            &*prepare_events,
+        )
+    });
     let stores = SessionStores {
         // The cap is a setting, so the session's store reads it as a snapshot.
         incidents: Arc::new(
@@ -272,6 +283,7 @@ pub(crate) fn start_patcher_inner(
             library: library.0.clone(),
             workshop_projects,
             host_flags,
+            should_elevate,
             stores,
             force_rebuild: config.force_rebuild.unwrap_or(false),
             telemetry: telemetry.handle(),
@@ -287,6 +299,7 @@ fn prepare_host(
     delivery: &PatcherDeliveryState,
     channel: Channel,
     bundled_host: &Path,
+    elevated: bool,
     events: &dyn PatcherEvents,
 ) -> AppResult<PreparedHost> {
     let staged = delivery
@@ -305,6 +318,12 @@ fn prepare_host(
         "Using the delivered patcher DLL"
     );
 
+    let staged = if elevated {
+        stage_elevated(&staged, bundled_host)?
+    } else {
+        staged
+    };
+
     let exe = staged.dir.join(HOST_EXE_NAME);
     let binaries = PatcherBinaries::identify(
         &staged.dir.join(HOOK_DLL_NAME),
@@ -320,6 +339,58 @@ fn prepare_host(
         exe,
         binaries,
         advisories,
+    })
+}
+
+/// Copies a delivered build into the administrator-only install directory for an elevated
+/// session, and returns the verified copy.
+///
+/// A high-integrity host must not load the DLL from the app data directory, which the user can
+/// write, so the copy goes under the install directory and a UAC prompt runs it. Fails with
+/// [`PatcherError::LeagueElevated`] if the install directory is unprotected or its copy is
+/// writable, and with [`PatcherError::InjectionFailed`] if the copy does not verify.
+fn stage_elevated(staged: &StagedPatcher, bundled_host: &Path) -> AppResult<StagedPatcher> {
+    use ltk_manager_runtime::patcher::staging::{
+        program_files_roots, stage_elevated as stage, StageRequest, StagingError,
+    };
+
+    let install_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .ok_or_else(|| {
+            AppError::Other("the manager cannot resolve its install directory".to_string())
+        })?;
+
+    let request = StageRequest {
+        source: staged.dir.clone(),
+        digest: staged.digest.clone(),
+        install_dir,
+    };
+
+    let staged_elevated =
+        stage(&request, bundled_host, &program_files_roots()).map_err(|error| {
+            tracing::error!(%error, "Could not stage the elevated patcher");
+            match error {
+                // Both refusals leave the reader the same two ways out: remove League's elevation,
+                // or install the manager where its binaries are protected.
+                StagingError::InstallDirUnprotected { .. }
+                | StagingError::DirectoryWritable { .. } => PatcherError::LeagueElevated,
+                other => PatcherError::InjectionFailed {
+                    stage: ltk_manager_runtime::patcher::InjectionStage::Host,
+                    message: other.to_string(),
+                },
+            }
+        })?;
+
+    tracing::info!(
+        dir = %staged_elevated.dir.display(),
+        digest = %staged_elevated.digest,
+        "Using the staged elevated patcher"
+    );
+
+    Ok(StagedPatcher {
+        dir: staged_elevated.dir,
+        ..staged.clone()
     })
 }
 

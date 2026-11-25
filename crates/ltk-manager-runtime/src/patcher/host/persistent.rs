@@ -27,12 +27,15 @@ pub struct PatcherHost {
     /// The executable that the host was spawned from. A session for another
     /// executable forces a respawn.
     exe: PathBuf,
+    /// Whether the host runs at high integrity. `--elevate` is fixed at spawn, so a session
+    /// that needs another mode respawns.
+    elevated: bool,
 }
 
 impl PatcherHost {
-    /// Spawn the host and start its persistent stdout reader thread.
-    pub fn spawn(exe_path: &Path) -> Result<Self, HostError> {
-        let mut proc = HostProcess::spawn(exe_path)?;
+    /// Spawns the host and starts its persistent stdout reader thread.
+    pub fn spawn(exe_path: &Path, elevate: bool) -> Result<Self, HostError> {
+        let mut proc = HostProcess::spawn(exe_path, elevate)?;
         let stderr_handle = proc.take_stderr().map(forward_stderr);
         let reader = match proc.take_event_reader() {
             Some(reader) => reader,
@@ -52,7 +55,13 @@ impl PatcherHost {
             reader_handle: Some(reader_handle),
             stderr_handle,
             exe: exe_path.to_path_buf(),
+            elevated: elevate,
         })
+    }
+
+    /// Whether the host runs at high integrity.
+    pub fn elevated(&self) -> bool {
+        self.elevated
     }
 
     /// Whether the host process is still running.

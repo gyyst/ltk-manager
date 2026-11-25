@@ -70,6 +70,36 @@ fn main() {
         return;
     }
 
+    // Before the single-instance plugin: a helper must not hand its arguments to a running
+    // manager, and it opens no window.
+    if let Some(request) =
+        ltk_manager_runtime::patcher::staging::StageRequest::from_args(std::env::args_os().skip(1))
+    {
+        let bundled_host = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("ltk_patcher_host.exe")));
+        let roots = ltk_manager_runtime::patcher::staging::program_files_roots();
+        let code = match bundled_host {
+            Some(host) => {
+                match ltk_manager_runtime::patcher::staging::run_helper(&request, &host, &roots) {
+                    Ok(staged) => {
+                        tracing::info!(dir = %staged.dir.display(), "Staged the elevated patcher");
+                        0
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "Staging the elevated patcher failed");
+                        1
+                    }
+                }
+            }
+            None => {
+                tracing::error!("The helper could not locate the bundled host");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
+
     ltk_manager_runtime::diagnostics::ids::LogIds::global().start_run();
     tracing::info!("Starting LTK Manager v{}", env!("CARGO_PKG_VERSION"));
     if let Some(log_dir) = &logging_guards.log_dir {

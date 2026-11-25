@@ -78,6 +78,8 @@ pub struct SessionParams {
     pub library: ModLibrary,
     pub workshop_projects: Vec<WorkshopTestProject>,
     pub host_flags: u32,
+    /// Whether the session runs its host at high integrity through the UAC bridge.
+    pub should_elevate: bool,
     /// Where the session's incidents and game records are written.
     pub stores: SessionStores,
     /// Whether the overlay is built from scratch rather than reused.
@@ -98,6 +100,7 @@ pub struct PatcherThread {
     library: ModLibrary,
     workshop_projects: Vec<WorkshopTestProject>,
     host_flags: u32,
+    should_elevate: bool,
     force_rebuild: bool,
     telemetry: Telemetry,
 }
@@ -137,6 +140,7 @@ impl PatcherThread {
             library,
             workshop_projects,
             host_flags,
+            should_elevate,
             stores,
             force_rebuild,
             telemetry,
@@ -168,6 +172,7 @@ impl PatcherThread {
             library,
             workshop_projects,
             host_flags,
+            should_elevate,
             force_rebuild,
             telemetry,
         };
@@ -318,6 +323,7 @@ impl PatcherThread {
         let result = session::run_injection_session(
             &self.host,
             host_exe,
+            self.should_elevate,
             &host_config,
             &self.stop_flag,
             &self.refresh,

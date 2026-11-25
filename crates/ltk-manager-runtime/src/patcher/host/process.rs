@@ -29,12 +29,21 @@ pub enum HostError {
 pub struct HostProcess {
     child: Child,
     exe_path: PathBuf,
+    elevated: bool,
 }
 
 impl HostProcess {
-    /// Spawn the host process.
-    pub fn spawn(exe_path: &Path) -> Result<Self, HostError> {
+    /// Spawns the host process.
+    ///
+    /// If `elevate` is true, passes `--elevate`, which raises a UAC prompt and runs the host
+    /// at high integrity. The host then loads the DLL beside it, which must be in a directory
+    /// the user cannot write.
+    pub fn spawn(exe_path: &Path, elevate: bool) -> Result<Self, HostError> {
         let mut command = Command::new(exe_path);
+
+        if elevate {
+            command.arg("--elevate");
+        }
 
         command
             .stdin(Stdio::piped())
@@ -47,7 +56,7 @@ impl HostProcess {
 
         hide_console(&mut command);
 
-        tracing::info!("Spawning host: {}", exe_path.display());
+        tracing::info!(elevated = elevate, "Spawning host: {}", exe_path.display());
 
         let child = command.spawn().map_err(|source| HostError::Spawn {
             path: exe_path.display().to_string(),
@@ -57,7 +66,13 @@ impl HostProcess {
         Ok(Self {
             child,
             exe_path: exe_path.to_path_buf(),
+            elevated: elevate,
         })
+    }
+
+    /// Whether the host was spawned with `--elevate`.
+    pub fn elevated(&self) -> bool {
+        self.elevated
     }
 
     /// Send a raw command line to the host's stdin.
@@ -236,7 +251,7 @@ mod tests {
     #[test]
     fn spawn_reports_a_missing_host_binary_with_the_path_it_tried() {
         let missing = std::env::temp_dir().join("ltk-manager-no-such-host.exe");
-        let Err(error) = HostProcess::spawn(&missing) else {
+        let Err(error) = HostProcess::spawn(&missing, false) else {
             panic!("spawning a missing binary should fail");
         };
         assert_matches!(error, HostError::Spawn { path, .. } => {

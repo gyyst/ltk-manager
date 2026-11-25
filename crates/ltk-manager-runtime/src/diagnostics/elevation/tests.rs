@@ -127,3 +127,62 @@ fn cause_and_type_serialize_in_kebab_case() {
     assert_eq!(ElevationCause::UacDisabled.to_string(), "uac-disabled");
     assert_eq!(ElevationType::Full.to_string(), "full");
 }
+
+fn league_process_elevated_when(pid: Option<u32>, elevated: Option<bool>, denied: bool) -> bool {
+    league_process_elevated_from(
+        &|name| {
+            if name == "leagueclientux.exe" {
+                pid
+            } else {
+                None
+            }
+        },
+        &|_| elevated,
+        &|_| denied,
+    )
+}
+
+#[test]
+fn league_process_elevated_is_false_without_a_league_process() {
+    assert!(!league_process_elevated_when(None, None, false));
+}
+
+#[test]
+fn league_process_elevated_is_true_when_the_client_token_is_elevated() {
+    assert!(league_process_elevated_when(Some(1234), Some(true), false));
+}
+
+#[test]
+fn league_process_elevated_is_false_when_the_client_token_is_not_elevated() {
+    assert!(!league_process_elevated_when(
+        Some(1234),
+        Some(false),
+        false
+    ));
+}
+
+/// An elevated process refuses the open, so the refusal answers the question the token
+/// read could not.
+#[test]
+fn league_process_elevated_is_true_when_the_open_is_denied() {
+    assert!(league_process_elevated_when(Some(1234), None, true));
+}
+
+#[test]
+fn league_process_elevated_checks_the_client_before_the_game() {
+    let looked_up = std::cell::RefCell::new(Vec::new());
+    let elevated = league_process_elevated_from(
+        &|name| {
+            looked_up.borrow_mut().push(name.to_string());
+            (name == "league of legends.exe").then_some(99)
+        },
+        &|_| Some(true),
+        &|_| false,
+    );
+
+    assert!(elevated);
+    assert_eq!(
+        looked_up.borrow().first().map(String::as_str),
+        Some("leagueclientux.exe")
+    );
+}

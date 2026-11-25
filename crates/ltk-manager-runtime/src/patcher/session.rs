@@ -141,15 +141,17 @@ pub fn normalize_overlay_prefix(prefix: &str) -> String {
 pub fn run_injection_session(
     host: &Arc<Mutex<Option<PatcherHost>>>,
     injector_exe: &Path,
+    elevate: bool,
     config: &HostConfig,
     stop_flag: &AtomicBool,
     refresh: &OverlayRefresh,
     observer: Arc<SessionObserver>,
 ) -> Result<SessionEnd, SessionError> {
-    let host_lines = ensure_host_started(host, injector_exe, config)?;
+    let host_lines = ensure_host_started(host, injector_exe, elevate, config)?;
 
     // Blocks until the game closes or the patcher is stopped.
     let (result, host_lines) = Injector::new()
+        .with_elevate(elevate)
         .on_event(move |event| observer.observe(event))
         .run_session(host_lines, host, stop_flag, refresh);
 
@@ -172,19 +174,21 @@ pub fn run_injection_session(
 }
 
 /// Configure the persistent host and begin a scan session, returning its event
-/// stream. Reuses the live host, and respawns it if it is missing, dead, or runs
-/// from another executable.
+/// stream. Reuses the live host, and respawns it if it is missing, dead, runs
+/// from another executable, or runs at another integrity level.
 fn ensure_host_started(
     host_arc: &Arc<Mutex<Option<PatcherHost>>>,
     exe_path: &Path,
+    elevate: bool,
     config: &HostConfig,
 ) -> Result<Receiver<HostLine>, HostError> {
     let mut guard = host_arc.lock();
 
     ensure_started(
         &mut guard,
-        || PatcherHost::spawn(exe_path),
+        |elevate| PatcherHost::spawn(exe_path, elevate),
         exe_path,
+        elevate,
         config,
     )
 }
@@ -197,6 +201,7 @@ fn ensure_host_started(
 trait SessionHost {
     fn is_alive(&mut self) -> bool;
     fn exe(&self) -> &Path;
+    fn elevated(&self) -> bool;
     fn drain_events(&mut self) -> bool;
     fn configure(&mut self, config: &HostConfig) -> Result<(), HostError>;
     fn start_scan(&mut self) -> Result<(), HostError>;
@@ -211,6 +216,10 @@ impl SessionHost for PatcherHost {
 
     fn exe(&self) -> &Path {
         PatcherHost::exe(self)
+    }
+
+    fn elevated(&self) -> bool {
+        PatcherHost::elevated(self)
     }
 
     fn drain_events(&mut self) -> bool {
@@ -238,8 +247,9 @@ impl SessionHost for PatcherHost {
 /// and borrow its event stream for the session.
 fn ensure_started<H: SessionHost>(
     slot: &mut Option<H>,
-    spawn: impl FnOnce() -> Result<H, HostError>,
+    spawn: impl FnOnce(bool) -> Result<H, HostError>,
     exe: &Path,
+    elevate: bool,
     config: &HostConfig,
 ) -> Result<Receiver<HostLine>, HostError> {
     // `drain_events` clears the previous session's trailing lines and doubles as
@@ -247,14 +257,19 @@ fn ensure_started<H: SessionHost>(
     // another session even if the process is still alive.
     let needs_spawn = match slot.as_mut() {
         None => true,
-        Some(host) => !host.is_alive() || host.exe() != exe || !host.drain_events(),
+        Some(host) => {
+            !host.is_alive()
+                || host.exe() != exe
+                || host.elevated() != elevate
+                || !host.drain_events()
+        }
     };
     if needs_spawn {
         if let Some(mut old) = slot.take() {
             // A dead host returns at once.
             old.shutdown();
         }
-        *slot = Some(spawn()?);
+        *slot = Some(spawn(elevate)?);
     }
 
     let result = {
@@ -306,6 +321,7 @@ mod tests {
         name: &'static str,
         alive: bool,
         exe: PathBuf,
+        elevated: bool,
         drain_ok: bool,
         fail_at: Option<FailAt>,
         events: Option<Receiver<HostLine>>,
@@ -320,6 +336,7 @@ mod tests {
                 name,
                 alive: true,
                 exe: PathBuf::from(HOST_EXE),
+                elevated: false,
                 drain_ok: true,
                 fail_at: None,
                 events: Some(rx),
@@ -339,6 +356,10 @@ mod tests {
 
         fn exe(&self) -> &Path {
             &self.exe
+        }
+
+        fn elevated(&self) -> bool {
+            self.elevated
         }
 
         fn drain_events(&mut self) -> bool {
@@ -403,13 +424,15 @@ mod tests {
             let log = Rc::clone(log);
             ensure_started(
                 slot,
-                move || {
+                move |elevate| {
                     *spawned.borrow_mut() += 1;
                     let mut host = FakeHost::new("fresh", &log);
                     host.exe = exe.to_path_buf();
+                    host.elevated = elevate;
                     Ok(host)
                 },
                 exe,
+                false,
                 &config(),
             )
         };
@@ -527,14 +550,83 @@ mod tests {
 
         let result = ensure_started(
             &mut slot,
-            || Err(HostError::StdoutClosed),
+            |_| Err(HostError::StdoutClosed),
             Path::new(HOST_EXE),
+            false,
             &config(),
         );
 
         assert_matches!(result, Err(HostError::StdoutClosed));
         assert!(slot.is_none());
         assert!(log.borrow().contains(&"dead:shutdown".to_string()));
+    }
+
+    /// `--elevate` is fixed at spawn, so a session that needs another mode must not reuse the
+    /// host that is already there.
+    #[test]
+    fn a_session_at_another_integrity_level_respawns_the_host() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut unelevated = FakeHost::new("unelevated", &log);
+        unelevated.elevated = false;
+        let mut slot = Some(unelevated);
+
+        let spawned = Rc::new(RefCell::new(0));
+        let result = {
+            let spawned = Rc::clone(&spawned);
+            let log = Rc::clone(&log);
+            ensure_started(
+                &mut slot,
+                move |elevate| {
+                    *spawned.borrow_mut() += 1;
+                    let mut host = FakeHost::new("fresh", &log);
+                    host.elevated = elevate;
+                    Ok(host)
+                },
+                Path::new(HOST_EXE),
+                true,
+                &config(),
+            )
+        };
+
+        assert!(result.is_ok());
+        assert_eq!(
+            *spawned.borrow(),
+            1,
+            "the elevated session must spawn a host"
+        );
+        assert_eq!(stream_owner(&result.unwrap()), "fresh");
+        assert!(log.borrow().contains(&"unelevated:shutdown".to_string()));
+        assert_eq!(slot.as_ref().map(|host| host.elevated), Some(true));
+    }
+
+    #[test]
+    fn a_session_at_the_same_integrity_level_reuses_the_host() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut elevated = FakeHost::new("elevated", &log);
+        elevated.elevated = true;
+        let mut slot = Some(elevated);
+
+        let spawned = Rc::new(RefCell::new(0));
+        let result = {
+            let spawned = Rc::clone(&spawned);
+            let log = Rc::clone(&log);
+            ensure_started(
+                &mut slot,
+                move |elevate| {
+                    *spawned.borrow_mut() += 1;
+                    let mut host = FakeHost::new("fresh", &log);
+                    host.elevated = elevate;
+                    Ok(host)
+                },
+                Path::new(HOST_EXE),
+                true,
+                &config(),
+            )
+        };
+
+        assert!(result.is_ok());
+        assert_eq!(*spawned.borrow(), 0, "the host must be reused");
+        assert_eq!(stream_owner(&result.unwrap()), "elevated");
     }
 
     #[test]

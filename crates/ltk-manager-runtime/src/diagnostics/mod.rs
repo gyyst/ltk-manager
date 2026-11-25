@@ -192,6 +192,14 @@ pub fn manager_is_elevated() -> bool {
     }
 }
 
+/// Whether a League process runs at high integrity right now.
+///
+/// Covers a client started by an elevated launcher such as WeGame, which sets no
+/// `RUNASADMIN` layer. Always `false` off Windows.
+pub fn league_is_elevated() -> bool {
+    elevation::league_process_elevated()
+}
+
 /// The fixed half of a check: its id, its label and its category.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CheckSpec {

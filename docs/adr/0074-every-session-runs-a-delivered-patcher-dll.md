@@ -1,6 +1,7 @@
 # ADR-0074: Every session runs a delivered patcher DLL
 
-- **Status:** Accepted (2026-10-31)
+- **Status:** Amended by [ADR-0081](0081-an-elevated-session-stages-its-binaries-in-the-install-directory.md)
+  (2026-10-31)
 - **Date:** 2026-10-31
 - **Crates:** `ltk-manager-runtime`, `ltk-manager-core`, `src-tauri`
 - **Related:** Supersedes [ADR-0067](0067-a-delivered-patcher-dll-runs-only-unelevated.md).

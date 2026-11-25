@@ -155,6 +155,7 @@ const ATTACH_PID_WINDOW: Duration = Duration::from_secs(1);
 /// `services::patcher`); the injector only runs the per-session event loop and,
 /// on stop, issues a `stop` command rather than killing the host.
 pub struct Injector {
+    elevate: bool,
     on_event: Option<EventCallback>,
 }
 
@@ -166,7 +167,19 @@ impl Default for Injector {
 
 impl Injector {
     pub fn new() -> Self {
-        Self { on_event: None }
+        Self {
+            elevate: false,
+            on_event: None,
+        }
+    }
+
+    /// Sets the integrity level that the session's host runs at.
+    ///
+    /// The flag only selects the hint of an unexpected exit, because the host is spawned by
+    /// [`ensure_host_started`](super::session::run_injection_session) with the same value.
+    pub fn with_elevate(mut self, elevate: bool) -> Self {
+        self.elevate = elevate;
+        self
     }
 
     /// Register a callback invoked when the injector observes a notable
@@ -477,10 +490,17 @@ impl Injector {
         });
     }
 
-    /// Build the error returned when the host process disappears without us
+    /// Builds the error returned when the host process disappears without us
     /// asking it to stop.
+    ///
+    /// A dismissed UAC prompt is the usual cause of an elevated host that never reports, so
+    /// the elevated path names it instead of antivirus.
     fn unexpected_exit_error(&self, last_error: Option<String>) -> InjectorError {
-        let base = "The injection host exited unexpectedly. It may have crashed or been blocked by antivirus.";
+        let base = if self.elevate {
+            "The injection host exited unexpectedly. If you dismissed the Windows User Account Control prompt, the host cannot run elevated, so accept the prompt the next time."
+        } else {
+            "The injection host exited unexpectedly. It may have crashed or been blocked by antivirus."
+        };
         match last_error {
             Some(detail) if !detail.is_empty() => {
                 InjectorError::Failed(format!("{base} (host reported: {detail})"))
@@ -616,9 +636,15 @@ mod tests {
 
     impl Harness {
         fn new() -> Self {
+            Self::with_elevate(false)
+        }
+
+        fn with_elevate(elevate: bool) -> Self {
             let events = Arc::new(Mutex::new(Vec::new()));
             let sink = Arc::clone(&events);
-            let injector = Injector::new().on_event(move |e| sink.lock().push(e));
+            let injector = Injector::new()
+                .with_elevate(elevate)
+                .on_event(move |e| sink.lock().push(e));
             let (tx, rx) = channel();
             Self {
                 injector,
@@ -701,6 +727,17 @@ mod tests {
             harness.control.was_stopped(),
             "a requested stop must be forwarded to the host"
         );
+    }
+
+    /// A dismissed UAC prompt looks the same as a crash to the channel, so the elevated path
+    /// has to name it.
+    #[test]
+    fn host_death_on_the_elevated_path_names_the_uac_prompt() {
+        let mut harness = Harness::with_elevate(true);
+        harness.close();
+
+        let msg = harness.run().expect_err("EOF must error").to_string();
+        assert!(msg.contains("User Account Control"), "got: {msg}");
     }
 
     #[test]

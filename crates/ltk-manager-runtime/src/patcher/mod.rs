@@ -8,10 +8,11 @@ pub mod injector;
 pub mod recorder;
 pub mod refresh;
 pub mod session;
+pub mod staging;
 pub mod state;
 
 pub use dll_lines::{DllLevel, DllLine};
-pub use elevation::check_unelevated;
+pub use elevation::{ElevationPlan, plan_for_system};
 pub use error::{InjectionStage, PatcherError};
 pub use events::PatcherEvents;
 pub use injector::InjectorEvent;
