@@ -39,15 +39,35 @@ const LAYERS: CheckSpec = CheckSpec::new(
 const COMPAT_KEY: &str = "Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers";
 
 #[cfg(target_os = "windows")]
-const BAD_PREFIXES: &[&str] = &["League", "Riot"];
-
-#[cfg(target_os = "windows")]
 const SUS_PREFIXES: &[&str] = &["cslol-", "ltk_patcher", "ltk-manager"];
+
+/// Executables of the Riot Client and League, matched by exact basename.
+///
+/// A prefix match also caught unrelated tools such as `LeagueAkari.exe`, whose `RUNASADMIN`
+/// layer then refused every patcher start.
+#[cfg(any(target_os = "windows", test))]
+const LEAGUE_RIOT_EXECUTABLES: &[&str] = &[
+    "league of legends.exe",
+    "leagueclient.exe",
+    "leagueclientux.exe",
+    "leagueclientuxrender.exe",
+    "riotclientservices.exe",
+    "riotclientux.exe",
+    "riotclientcrashhandler.exe",
+];
+
+/// Whether `name` is an executable of League or the Riot Client, ignoring case.
+#[cfg(any(target_os = "windows", test))]
+fn is_league_or_riot_executable(name: &str) -> bool {
+    LEAGUE_RIOT_EXECUTABLES
+        .iter()
+        .any(|exe| name.eq_ignore_ascii_case(exe))
+}
 
 /// Returns the basename of a value name (path) for matching against prefix
 /// lists. Compat-flag value names are full paths like
 /// `C:\Riot Games\League of Legends\League of Legends.exe`.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn basename(path: &str) -> &str {
     match path.rfind(['\\', '/']) {
         Some(i) => &path[i + 1..],
@@ -63,7 +83,7 @@ pub fn check_compat_flags() -> Check {
     for (root, root_label) in ROOTS {
         for value_name in reg_list_value_names(*root, COMPAT_KEY) {
             let name = basename(&value_name);
-            if BAD_PREFIXES.iter().any(|p| name.starts_with(p)) {
+            if is_league_or_riot_executable(name) {
                 bad.push((root_label.to_string(), value_name.clone()));
                 continue;
             }
@@ -157,7 +177,7 @@ fn run_as_admin_entries() -> Vec<(String, String)> {
     for (root, label) in ROOTS {
         for value_name in reg_list_value_names(*root, COMPAT_KEY) {
             let name = basename(&value_name);
-            if !BAD_PREFIXES.iter().any(|p| name.starts_with(p)) {
+            if !is_league_or_riot_executable(name) {
                 continue;
             }
 
@@ -208,8 +228,49 @@ pub fn check_compat_flags() -> Check {
 }
 
 #[cfg(test)]
-#[cfg(target_os = "windows")]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn basename_strips_drive_path() {
+        assert_eq!(
+            basename(r"C:\Riot Games\League of Legends\League of Legends.exe"),
+            "League of Legends.exe"
+        );
+    }
+
+    #[test]
+    fn basename_handles_no_separator() {
+        assert_eq!(basename("League of Legends.exe"), "League of Legends.exe");
+    }
+
+    #[test]
+    fn is_league_or_riot_executable_matches_the_real_executables() {
+        for name in LEAGUE_RIOT_EXECUTABLES {
+            assert!(is_league_or_riot_executable(name), "{name} should match");
+        }
+    }
+
+    #[test]
+    fn is_league_or_riot_executable_ignores_case() {
+        assert!(is_league_or_riot_executable("LeagueClientUx.exe"));
+        assert!(is_league_or_riot_executable("RIOTCLIENTSERVICES.EXE"));
+    }
+
+    /// `LeagueAkari.exe` carries its own `RUNASADMIN` layer, and a prefix match refused
+    /// every patcher start for it.
+    #[test]
+    fn is_league_or_riot_executable_rejects_third_party_tools() {
+        assert!(!is_league_or_riot_executable("LeagueAkari.exe"));
+        assert!(!is_league_or_riot_executable("LeagueOfLegendsHelper.exe"));
+        assert!(!is_league_or_riot_executable("RiotClientPatcher.exe"));
+        assert!(!is_league_or_riot_executable("explorer.exe"));
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_os = "windows")]
+mod windows_tests {
     use super::*;
 
     #[test]
@@ -232,18 +293,5 @@ mod tests {
                  reg delete \"HKLM\\{COMPAT_KEY}\" /v \"C:\\Riot\\RiotClientServices.exe\" /f"
             )
         );
-    }
-
-    #[test]
-    fn basename_strips_drive_path() {
-        assert_eq!(
-            basename(r"C:\Riot Games\League of Legends\League of Legends.exe"),
-            "League of Legends.exe"
-        );
-    }
-
-    #[test]
-    fn basename_handles_no_separator() {
-        assert_eq!(basename("League of Legends.exe"), "League of Legends.exe");
     }
 }
